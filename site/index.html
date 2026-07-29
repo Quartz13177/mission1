@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>미션1 - 나의 개발 워크스테이션</title>
+<style>
+  body { font-family: -apple-system, "Apple SD Gothic Neo", sans-serif;
+         background: linear-gradient(160deg,#0f172a,#1e3a8a);
+         display:grid; place-items:center; min-height:100vh; margin:0; }
+  .card { background:#fff; color:#16233d; padding:40px; border-radius:16px;
+          max-width:560px; line-height:1.8; box-shadow:0 20px 50px rgba(0,0,0,.4); }
+  h1 { margin-top:0; font-size:26px; }
+  code { background:#eef2ff; padding:2px 6px; border-radius:4px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>내 컴퓨터에 만든 개발자용 작업실</h1>
+    <p>이 페이지는 <b>직접 작성한 Dockerfile</b>로 빌드한
+       커스텀 nginx 컨테이너가 보여주는 화면입니다.</p>
+    <ul>
+      <li>실행 환경 : macOS + OrbStack</li>
+      <li>베이스 이미지 : <code>nginx:alpine</code></li>
+      <li>이미지 이름 : <code>my-custom-nginx:1.0</code></li>
+    </ul>
+  </div>
+</body>
+</html>
