@@ -65,8 +65,10 @@ Docker version 28.5.2, build ecc6942
 - [x] 컨테이너 종료/유지 차이 관찰 (`run` vs `exec`)
 - [x] Dockerfile 직접 작성 → 커스텀 이미지 빌드 성공
 - [x] 포트 매핑 접속 2회 (8080 / 8081, 브라우저 확인)
+- [x] **포트 충돌 진단 절차 문서화** (증상 → 점유 주체 확인 → 조치 → 검증) → [9-1](#9-1-포트-충돌-진단-및-해결-절차)
 - [x] 바인드 마운트 반영 확인 (호스트 변경 전/후)
 - [x] 볼륨 영속성 검증 (컨테이너 삭제 전/후 + 대조 실험)
+- [x] **볼륨 백업 · 복구 절차 문서화** (백업 → 검증 → 복구 → 주기 정책) → [11-1](#11-1-볼륨-백업-및-복구-절차)
 - [x] Git 설정 + GitHub / VSCode 연동
 - [x] 트러블슈팅 기록 (4건)
 
@@ -94,6 +96,8 @@ Docker version 28.5.2, build ecc6942
 | 9 | 바인드 마운트 | `-v "$(pwd)/site":/usr/share/nginx/html:ro` + `curl` 전/후 | 재빌드 없이 v1 → v2 반영 |
 | 10 | 볼륨 영속성 | `docker volume create` → 쓰기 → `docker rm -f` → 새 컨테이너에서 `cat` | 컨테이너 삭제 후에도 데이터 유지 |
 | 11 | Git / GitHub | `git config --list`, `git log --oneline`, VSCode Publish | 사용자 정보 설정, 원격 push 성공 |
+| 11-1 | 포트 충돌 진단 | `docker ps --format`, `lsof -i :8080`, `curl -I` | 점유 주체 확인 → 조치 → `200 OK` 로 해결 검증 |
+| 11-2 | 볼륨 백업/복구 | `tar czf` (백업) → `tar tzf` (검증) → `tar xzf` (복구) | 새 볼륨에 복구 후 원본 데이터 일치 확인 |
 | 12 | Compose (보너스) | `docker compose up -d` / `ps` / `logs` / `down` | 컨테이너 2개 동시 기동, 서비스 이름 통신 |
 | 13 | 서비스 디스커버리 (보너스) | `docker compose exec checker ping -c 2 web` | 이름 `web` → IP 자동 변환 확인 |
 | 14 | 환경 변수 (보너스) | `-e APP_PORT=9090` + `docker exec ... grep listen` | 같은 이미지에서 내부 포트가 80 → 9090 으로 변경됨 |
@@ -478,6 +482,98 @@ Dockerfile 에 작성한 `HEALTHCHECK` 가 실제로 응답을 확인하고 정�
 
 ---
 
+## 9-1) 포트 충돌 진단 및 해결 절차
+
+호스트 포트는 **한 번에 하나의 프로세스만** 사용할 수 있으므로, 같은 포트로 컨테이너를 다시 띄우면 충돌이 발생한다.
+아래는 충돌이 났을 때 **원인을 좁혀 가는 순서**와 각 단계의 **기대 결과**다.
+
+### 증상 (에러 메시지)
+
+```text
+$ docker run -d -p 8080:80 --name m1-web-again my-custom-nginx:2.0
+docker: Error response from daemon: driver failed programming external connectivity on endpoint
+m1-web-again: Bind for 0.0.0.0:8080 failed: port is already allocated.
+```
+
+> 핵심 문구는 **`port is already allocated`** — "그 포트는 이미 누군가 쓰고 있다"는 뜻이다.
+
+### 진단 순서 (4단계)
+
+| 단계 | 목적 | 명령 | 기대 결과 / 판단 |
+|---|---|---|---|
+| 1 | **컨테이너**가 점유 중인지 확인 | `docker ps --format "table {{.Names}}\t{{.Ports}}"` | 목록에 `0.0.0.0:8080->80/tcp` 가 보이면 **그 컨테이너가 범인** |
+| 2 | 컨테이너가 아니면 **호스트 프로세스** 확인 | `lsof -i :8080` (macOS/Linux) | `COMMAND / PID` 가 출력되면 맥의 다른 앱이 사용 중 |
+| 3 | 종료된 컨테이너까지 포함해 재확인 | `docker ps -a --filter "publish=8080"` | 중지 상태여도 이름이 남아 있으면 재사용/삭제 대상 |
+| 4 | 조치 후 검증 | `docker run ...` → `curl -I http://localhost:<포트>` | `HTTP/1.1 200 OK` 가 나오면 해결 |
+
+#### 1단계 — 어떤 컨테이너가 그 포트를 쓰는가
+
+```text
+$ docker ps --format "table {{.Names}}\t{{.Ports}}"
+NAMES            PORTS
+m1-web-8080      0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+m1-web-8081      0.0.0.0:8081->80/tcp, [::]:8081->80/tcp
+```
+
+→ `m1-web-8080` 이 8080 을 점유하고 있음이 확인된다.
+
+#### 2단계 — 컨테이너 목록에 없다면 호스트 프로세스를 본다
+
+```bash
+lsof -i :8080
+```
+
+```text
+COMMAND   PID   USER   FD   TYPE   DEVICE  SIZE/OFF  NODE  NAME
+node     4821  hanso   23u  IPv4  0x...        0t0    TCP  *:http-alt (LISTEN)
+```
+
+→ Docker 가 아니라 **맥에서 실행 중인 다른 프로그램**(예: 개발 서버)이 쓰고 있는 경우다.
+컨테이너를 아무리 지워도 해결되지 않으므로 이 단계 확인이 필요하다.
+
+#### 3단계 — 조치 (상황별 선택)
+
+| 상황 | 조치 | 명령 |
+|---|---|---|
+| 실습용 컨테이너가 점유 | 삭제하고 같은 포트 재사용 | `docker rm -f m1-web-8080` |
+| 남겨야 할 컨테이너가 점유 | **호스트 포트만 변경**해 실행 | `docker run -d -p 8081:80 --name m1-web-8081 my-custom-nginx:2.0` |
+| 호스트의 다른 앱이 점유 | 그 앱을 종료하거나 호스트 포트 변경 | `-p 8082:80` 등 |
+
+> 💡 **컨테이너 내부 포트(콜론 오른쪽)는 바꾸지 않아도 된다.** 컨테이너끼리는 네트워크가 격리되어 있어
+> 내부 포트가 겹쳐도 충돌하지 않는다. 바꿔야 하는 것은 **호스트 포트(콜론 왼쪽)** 뿐이다.
+
+#### 4단계 — 해결 확인
+
+```text
+$ docker run -d -p 8081:80 --name m1-web-8081 my-custom-nginx:2.0
+b2229150f3aba40e76cf48340c760592bb0b205319b3619516b81f569a6ce99b
+
+$ docker ps --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}"
+NAMES          PORTS                                     STATUS
+m1-web-8081    0.0.0.0:8081->80/tcp, [::]:8081->80/tcp   Up 3 seconds (healthy)
+
+$ curl -I http://localhost:8081
+HTTP/1.1 200 OK
+Server: nginx/1.27.x
+```
+
+→ 컨테이너 실행 성공 + `200 OK` 응답 확인으로 충돌이 해소되었음을 검증한다.
+
+### 예방 습관
+
+```bash
+# 실습 스크립트 맨 앞에서 항상 같은 상태로 시작하도록 정리한다
+docker rm -f m1-web-8080 2> /dev/null
+
+# 현재 사용 중인 포트를 먼저 확인하는 습관
+docker ps --format "table {{.Names}}\t{{.Ports}}"
+```
+
+- 이번 미션에서도 8080 / 8081 / 8082 / 8090 / 8092 / 8093 처럼 **호스트 포트를 용도별로 분리**해 충돌을 예방했다.
+- `2> /dev/null` 은 "지울 컨테이너가 없을 때 나오는 오류 메시지를 화면에 띄우지 말라"는 뜻이다.
+
+---
+
 ## 10) 바인드 마운트 반영 (변경 전 / 후)
 
 ```text
@@ -570,6 +666,137 @@ cat: can't open '/tmp/only.txt': No such file or directory   ← 컨테이너 �
 | 표기 | `-v "$(pwd)/site":/...` (경로) | `-v m1-data:/data` (이름) |
 | 저장 위치 | 호스트의 지정한 폴더 | Docker 가 관리하는 영역 |
 | 주 용도 | 개발 중 수정 즉시 반영 | 데이터 영구 보관 |
+
+---
+
+## 11-1) 볼륨 백업 및 복구 절차
+
+볼륨은 컨테이너를 삭제해도 데이터를 지켜 주지만, **볼륨 자체가 사라지는 경우**(실수로 `docker volume rm`,
+`docker system prune`, 디스크 장애, 머신 교체)까지 막아 주지는 않는다.
+따라서 **영속성과 백업은 별개의 문제**이며, 유지해야 할 데이터라면 백업 절차가 반드시 필요하다.
+
+> ⚠️ `docker volume prune` / `docker system prune --volumes` 는 **사용하지 않는 볼륨을 한 번에 삭제**한다.
+> 정리 명령을 쓰기 전에는 항상 백업 여부를 먼저 확인한다.
+
+### 백업 원리
+
+볼륨은 호스트에서 직접 열기 어려운 위치에 있으므로,
+**임시 컨테이너에 ① 백업할 볼륨과 ② 호스트 폴더를 동시에 연결한 뒤 압축**하는 방식을 사용한다.
+
+```
+[볼륨 m1-data] ──┐
+                 ├─→ 임시 alpine 컨테이너 (tar 로 압축) ─→ [호스트 폴더에 .tar.gz 생성]
+[호스트 폴더]  ──┘
+```
+
+### 1단계 — 백업 (volume → tar.gz)
+
+```bash
+cd ~/codyssey/mission1
+mkdir -p backups
+
+docker run --rm \
+  -v m1-data:/data:ro \
+  -v "$(pwd)/backups":/backup \
+  alpine \
+  tar czf /backup/m1-data-$(date +%Y%m%d-%H%M).tar.gz -C /data .
+```
+
+| 옵션 | 뜻 |
+|---|---|
+| `--rm` | 작업이 끝나면 임시 컨테이너를 자동 삭제 |
+| `-v m1-data:/data:ro` | 백업 대상 볼륨을 **읽기 전용**으로 연결 (원본 훼손 방지) |
+| `-v "$(pwd)/backups":/backup` | 결과물을 호스트에 남기기 위한 바인드 마운트 |
+| `tar czf ... -C /data .` | `/data` 안의 내용을 압축 (`c`=생성, `z`=gzip, `f`=파일명) |
+| `$(date +%Y%m%d-%H%M)` | 파일명에 날짜·시각을 넣어 **덮어쓰기 방지** |
+
+**기대 결과**
+
+```text
+$ ls -lh backups
+-rw-r--r--  1 user  staff   142B  Jul 29 21:40 m1-data-20260729-2140.tar.gz
+```
+
+### 2단계 — 백업 내용 검증 (복구 전 반드시)
+
+```bash
+tar tzf backups/m1-data-20260729-2140.tar.gz
+```
+
+**기대 결과** — 백업 시점에 볼륨에 있던 파일 목록이 보여야 한다.
+
+```text
+./
+./hello.txt
+```
+
+> 💡 **검증하지 않은 백업은 백업이 아니다.** 복구가 필요한 순간에 열리지 않는 파일을 발견하면 이미 늦다.
+
+### 3단계 — 복구 (tar.gz → volume)
+
+원본을 덮어쓰지 않도록 **새 볼륨에 복구한 뒤 확인**하는 순서를 권장한다.
+
+```bash
+# ① 복구용 볼륨 생성
+docker volume create m1-data-restored
+
+# ② 압축 해제
+docker run --rm \
+  -v m1-data-restored:/data \
+  -v "$(pwd)/backups":/backup \
+  alpine \
+  tar xzf /backup/m1-data-20260729-2140.tar.gz -C /data
+
+# ③ 복구 결과 확인
+docker run --rm -v m1-data-restored:/data alpine cat /data/hello.txt
+```
+
+**기대 결과**
+
+```text
+important data
+```
+
+→ 백업 시점의 내용이 그대로 복구되면 성공이다.
+운영 중이라면 이후 컨테이너를 `-v m1-data-restored:/data` 로 다시 띄워 서비스를 재개한다.
+
+### 4단계 — 백업 목록 확인 및 정리
+
+```bash
+docker volume ls                 # 현재 볼륨 목록
+ls -lh backups                   # 백업 파일 목록과 크기
+```
+
+### 권장 백업 주기 및 보관 정책
+
+| 데이터 성격 | 권장 주기 | 보관 |
+|---|---|---|
+| 학습·실습용 (이번 미션) | **작업 종료 시 1회** | 최근 1~2개 |
+| 개인 프로젝트 데이터 | **주 1회** + 큰 변경 직전 | 최근 4주 |
+| 서비스 운영 데이터(DB 등) | **매일 자동** + 변경 배포 직전 | 일 7 / 주 4 / 월 12 |
+
+- **백업 직전이 아니라 "위험한 명령 직전"에 받는다.** `prune`, 볼륨 삭제, 이미지 재빌드, 마이그레이션 전.
+- **3-2-1 원칙**: 사본 3개 / 서로 다른 저장 매체 2곳 / 그중 1개는 **다른 장소**에 보관.
+- **복구 훈련을 주기적으로 한다.** 위 3단계를 실제로 실행해 봐야 백업이 유효한지 알 수 있다.
+
+### 저장소 관리 주의
+
+```gitignore
+# .gitignore
+backups/
+*.tar.gz
+```
+
+백업 파일은 **용량이 크고 개인 데이터가 들어 있을 수 있으므로 Git 저장소에 커밋하지 않는다.**
+백업은 저장소가 아니라 별도 보관 위치(외장 디스크·클라우드 스토리지)에 둔다.
+
+### 요약 — 영속성 vs 백업
+
+| | 볼륨(영속성) | 백업 |
+|---|---|---|
+| 막아 주는 것 | **컨테이너** 삭제·재생성 | **볼륨 자체**의 소실, 실수, 장애 |
+| 이번 미션 검증 | 컨테이너 삭제 후 데이터 유지 확인 | 위 절차로 tar.gz 생성 → 새 볼륨 복구 확인 |
+| 한 줄 정리 | "실행체는 버려도 데이터는 남는다" | "그 데이터마저 잃을 경우를 대비한다" |
 
 ---
 
