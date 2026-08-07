@@ -215,7 +215,7 @@ memo.txt
 
 ## 7) Docker 설치 점검 및 기본 운영 로그
 
-### 7-1. 데몬 동작 확인
+### 7-1. 동작 확인
 
 ```text
 $ docker info | head -20
@@ -233,7 +233,6 @@ Server:
  Storage Driver: overlay2
 ```
 
-- `Server:` 항목 출력 = **데몬 정상 동작**
 - `Context: orbstack` = **OrbStack 엔진 사용 중** (sudo 없이 컨테이너 실행 가능한 근거)
 
 ### 7-2. hello-world 실행
